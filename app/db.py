@@ -196,6 +196,25 @@ def immediate_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connecti
         raise
 
 
+@contextmanager
+def read_snapshot(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """Open a consistent read-only snapshot (BEGIN ... COMMIT/ROLLBACK).
+
+    In WAL mode the first read inside the transaction pins a snapshot of the
+    whole database; every later read in the same transaction sees exactly that
+    version, even when other connections commit writes meanwhile.  The read
+    transaction is always released -- committed on success, rolled back when
+    the block raises -- so the connection never leaks an open snapshot.
+    """
+    conn.execute("BEGIN")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
 # ---------------------------------------------------------------- addresses --
 
 ADDRESS_FIELDS = ("line1", "city", "state", "postal_code", "country", "external_id")

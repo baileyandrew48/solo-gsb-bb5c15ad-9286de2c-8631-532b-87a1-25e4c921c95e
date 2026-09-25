@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -51,6 +51,22 @@ def get_conn() -> db.sqlite3.Connection:
         _conn = db.connect()
         db.init_db(_conn)
     return _conn
+
+
+def fresh_conn() -> Iterator[db.sqlite3.Connection]:
+    """A dedicated per-request connection, closed when the request ends.
+
+    The shared ``get_conn`` connection serves every request, so it cannot
+    carry one endpoint's transaction boundary: an open transaction on it
+    would leak into concurrent requests (and break their own ``BEGIN``).
+    Endpoints that need a private read/write transaction scope use this
+    instead.
+    """
+    conn = db.connect()
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def settings_dep() -> Settings:
@@ -209,7 +225,7 @@ async def preview_csv(file: UploadFile = File(...),
 
 @app.get("/api/addresses/preview/{token}/impact")
 def preview_impact(token: str,
-                   conn: db.sqlite3.Connection = Depends(get_conn),
+                   conn: db.sqlite3.Connection = Depends(fresh_conn),
                    settings: Settings = Depends(settings_dep)) -> dict[str, Any]:
     """导入影响预演：对预览凭证中的有效待导入行做内存干跑。
 
@@ -218,6 +234,11 @@ def preview_impact(token: str,
     及复核共识逻辑重跑按日志时间倒序取出的最近 100 个不同原始查询；逐条
     对比前后状态与自动命中目标，分类为 改善 / 退化 / 目标改派 / 不变 并汇总。
     无效及重复行不参与；预演不写入地址和匹配日志，凭证保持有效。
+
+    凭证校验、地址读取、最近查询与共识读取都在**同一个 SQLite 一致性读快照**
+    内完成（本接口使用独立的每请求连接，不占用共享连接）：校验通过后即使
+    其他请求确认了导入，预演仍只基于凭证对应的那一版地址表，不会混用两个
+    版本；校验发现表已变则返回 409，须重新预览。
     """
     try:
         return import_impact.compute_impact(conn, settings, token)

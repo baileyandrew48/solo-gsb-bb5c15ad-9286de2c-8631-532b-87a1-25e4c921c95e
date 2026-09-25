@@ -4,6 +4,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
+from app import db as app_db  # noqa: E402
 from app.main import app, get_conn  # noqa: E402
 
 
@@ -262,3 +263,83 @@ def test_impact_recent_distinct_queries_capped_at_100(client):
     assert len(dup) == 1
     latest_id = client.get("/api/matches?limit=1").json()["items"][0]["id"]
     assert dup[0]["latest_match_id"] == latest_id
+
+
+def test_impact_consistent_snapshot_under_concurrent_write(client, monkeypatch):
+    """A confirm landing *between* the voucher check and the address read must
+    not leak into the report: the whole dry-run sees one read snapshot."""
+    _add_address(client, address="600 Impfx Race Road", city="Raceville",
+                 external_id="IMP-RACE-1")
+    query = "600 Impfx Race Road, Raceville"
+    m = client.post("/api/match", json={"query": query}).json()
+    assert m["status"] == "auto_matched"
+    base_id = m["best_id"]
+
+    csv_bytes = b"external_id,address\nIMP-RACE-2,1 Impfx Race Court\n"
+    token = _preview(client, csv_bytes)["preview_token"]
+
+    # Simulate a concurrent confirm: right after the voucher's table digest
+    # was verified, another connection deletes the base address and commits.
+    real_all_addresses = app_db.all_addresses
+    deleted = {"done": False}
+
+    def concurrent_delete(conn):
+        if not deleted["done"]:
+            deleted["done"] = True
+            other = app_db.connect()
+            try:
+                other.execute("DELETE FROM addresses WHERE id = ?", (base_id,))
+                other.commit()
+            finally:
+                other.close()
+        return real_all_addresses(conn)
+
+    monkeypatch.setattr(app_db, "all_addresses", concurrent_delete)
+
+    r = _impact(client, token)
+    assert r.status_code == 200
+    item = _item_for(r.json(), query)
+    # The rehearsal is pinned to the snapshot the voucher was validated
+    # against: the before-run still auto-hits the base address even though
+    # the live table had already lost it mid-request.  Without the snapshot
+    # the before-verdict would be computed against the newer (deleted) table
+    # while the voucher check saw the older one -- a mixed-version report.
+    assert item["before"]["status"] == "auto_matched"
+    assert item["before"]["target"] == {
+        "kind": "existing", "id": base_id, "full_text": "600 Impfx Race Road",
+    }
+    assert item["category"] == "unchanged"
+    # The endpoint's transaction boundary does not leak onto the shared conn.
+    assert get_conn().in_transaction is False
+
+
+def test_read_snapshot_pins_version_and_always_releases():
+    """``db.read_snapshot``: consistent reads, released on success and error."""
+    conn = app_db.connect()
+    other = app_db.connect()
+    try:
+        with app_db.read_snapshot(conn):
+            pinned = app_db.count_addresses(conn)
+            app_db.insert_address(
+                other,
+                full_text="1 Impfxsnap Anchor Lane",
+                tokens=["impfxsnap", "anchor", "ln"],
+                house="1",
+                fields={},
+                raw={"full_text": "1 Impfxsnap Anchor Lane"},
+            )
+            other.commit()
+            # The open snapshot still sees the version pinned at its first read.
+            assert app_db.count_addresses(conn) == pinned
+        # Released on success: the next read observes the committed write.
+        assert conn.in_transaction is False
+        assert app_db.count_addresses(conn) == pinned + 1
+
+        # Released on error too: an exception rolls the read transaction back.
+        with pytest.raises(RuntimeError):
+            with app_db.read_snapshot(conn):
+                raise RuntimeError("boom")
+        assert conn.in_transaction is False
+    finally:
+        conn.close()
+        other.close()

@@ -25,7 +25,10 @@ Each query is classified by comparing the two verdicts:
 Invalid and duplicate CSV rows never participate (they are not in the
 voucher's valid-row list), and the dry-run writes neither addresses nor
 match logs: the only reads are the voucher, the address table snapshot and
-the match/review history.
+the match/review history.  All of those reads run inside a single SQLite
+read snapshot (``db.read_snapshot``), so the voucher's table-digest check
+and the rehearsal itself always see the same version of the database --
+a concurrent confirm can never make a report mix two table versions.
 """
 from __future__ import annotations
 
@@ -237,67 +240,79 @@ def compute_impact(conn: sqlite3.Connection, settings: Settings,
     voucher cannot be honoured.  Purely in-memory: no address row and no
     match log is ever written, and the voucher stays valid for a later
     confirm.
+
+    Every read -- voucher validation, the address table, the recent queries
+    and the review-consensus history -- runs inside **one** SQLite read
+    snapshot (``db.read_snapshot``).  The snapshot is pinned before the
+    voucher's table digest is checked, so a concurrent confirm committing in
+    the middle of the rehearsal can never make the report mix two table
+    versions: either the check sees the change and fails with 409, or every
+    later read keeps seeing exactly the version the voucher was validated
+    against.  The caller must pass a connection with no open transaction
+    (the endpoint uses a dedicated per-request connection, not the shared
+    one), and the read transaction is released even when validation raises.
     """
-    voucher = _load_voucher(conn, token)
-    valid_rows = json.loads(voucher["valid_rows_json"])
-    temp_rows = _temp_address_rows(valid_rows)
+    with db.read_snapshot(conn):
+        voucher = _load_voucher(conn, token)
+        valid_rows = json.loads(voucher["valid_rows_json"])
+        temp_rows = _temp_address_rows(valid_rows)
 
-    # One snapshot of the current table is shared by every "before" run; the
-    # merged table (current rows in id order, then the new rows in CSV line
-    # order -- exactly how all_addresses would return them after a real
-    # import) backs every "after" run.
-    current_rows = list(db.all_addresses(conn))
-    merged_rows = current_rows + temp_rows
+        # One snapshot of the current table is shared by every "before" run; the
+        # merged table (current rows in id order, then the new rows in CSV line
+        # order -- exactly how all_addresses would return them after a real
+        # import) backs every "after" run.
+        current_rows = list(db.all_addresses(conn))
+        merged_rows = current_rows + temp_rows
 
-    queries = _recent_distinct_queries(conn)
+        queries = _recent_distinct_queries(conn)
 
-    items: list[dict[str, Any]] = []
-    for query, latest_match_id in queries:
-        before = _run_verdict(conn, query, current_rows, settings)
-        after = _run_verdict(conn, query, merged_rows, settings)
-        category, reason = _classify(before, after)
-        items.append({
-            "query": query,
-            "latest_match_id": latest_match_id,
-            "before": {k: v for k, v in before.items() if k != "target_key"},
-            "after": {k: v for k, v in after.items() if k != "target_key"},
-            "category": category,
-            "category_label": CATEGORY_LABELS[category],
-            "reason": reason,
-        })
+        items: list[dict[str, Any]] = []
+        for query, latest_match_id in queries:
+            before = _run_verdict(conn, query, current_rows, settings)
+            after = _run_verdict(conn, query, merged_rows, settings)
+            category, reason = _classify(before, after)
+            items.append({
+                "query": query,
+                "latest_match_id": latest_match_id,
+                "before": {k: v for k, v in before.items() if k != "target_key"},
+                "after": {k: v for k, v in after.items() if k != "target_key"},
+                "category": category,
+                "category_label": CATEGORY_LABELS[category],
+                "reason": reason,
+            })
 
-    items.sort(key=lambda it: (_CATEGORY_RANK[it["category"]],
-                               -it["latest_match_id"]))
+        items.sort(key=lambda it: (_CATEGORY_RANK[it["category"]],
+                                   -it["latest_match_id"]))
 
-    summary = {
-        "total": len(items),
-        **{cat: sum(1 for it in items if it["category"] == cat)
-           for cat in VALID_CATEGORIES},
-    }
+        summary = {
+            "total": len(items),
+            **{cat: sum(1 for it in items if it["category"] == cat)
+               for cat in VALID_CATEGORIES},
+        }
 
-    return {
-        "generated_at": _now(),
-        "filename": voucher["filename"],
-        "preview_created_at": voucher["created_at"],
-        "preview_expires_at": voucher["expires_at"],
-        "valid_rows": voucher["valid_count"],
-        "new_addresses": [
-            {
-                "csv_line": row["csv_line"],
-                "full_text": row["full_text"],
-                "house": row["house"],
-                "external_id": row["external_id"],
-            }
-            for row in temp_rows
-        ],
-        "query_limit": IMPACT_QUERY_LIMIT,
-        "query_count": len(items),
-        "summary": summary,
-        "thresholds": {
-            "auto_threshold": settings.auto_threshold,
-            "margin_threshold": settings.margin_threshold,
-            "reject_threshold": settings.reject_threshold,
-            "token_weight": settings.token_weight,
-        },
-        "items": items,
-    }
+        return {
+            "generated_at": _now(),
+            "filename": voucher["filename"],
+            "preview_created_at": voucher["created_at"],
+            "preview_expires_at": voucher["expires_at"],
+            "valid_rows": voucher["valid_count"],
+            "new_addresses": [
+                {
+                    "csv_line": row["csv_line"],
+                    "full_text": row["full_text"],
+                    "house": row["house"],
+                    "external_id": row["external_id"],
+                }
+                for row in temp_rows
+            ],
+            "query_limit": IMPACT_QUERY_LIMIT,
+            "query_count": len(items),
+            "summary": summary,
+            "thresholds": {
+                "auto_threshold": settings.auto_threshold,
+                "margin_threshold": settings.margin_threshold,
+                "reject_threshold": settings.reject_threshold,
+                "token_weight": settings.token_weight,
+            },
+            "items": items,
+        }

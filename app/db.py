@@ -196,6 +196,27 @@ def immediate_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connecti
         raise
 
 
+@contextmanager
+def read_snapshot(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """Pin one consistent read snapshot for a block of SELECTs.
+
+    The deferred transaction's first read fixes the snapshot (in WAL mode a
+    reader keeps seeing that database version no matter what other connections
+    commit afterwards), so every SELECT inside the block observes exactly the
+    same state -- e.g. a voucher's table-snapshot check and the address rows
+    read afterwards can never come from two different versions of the table.
+
+    The block must not write.  The read transaction is always released
+    (rolled back), even when the block raises, so no snapshot is ever leaked
+    on the connection.
+    """
+    conn.execute("BEGIN")
+    try:
+        yield conn
+    finally:
+        conn.rollback()
+
+
 # ---------------------------------------------------------------- addresses --
 
 ADDRESS_FIELDS = ("line1", "city", "state", "postal_code", "country", "external_id")

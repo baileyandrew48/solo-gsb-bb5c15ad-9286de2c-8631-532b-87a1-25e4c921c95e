@@ -26,6 +26,14 @@ Invalid and duplicate CSV rows never participate (they are not in the
 voucher's valid-row list), and the dry-run writes neither addresses nor
 match logs: the only reads are the voucher, the address table snapshot and
 the match/review history.
+
+All of those reads must observe **one consistent database version**: the
+endpoint runs ``compute_impact`` on a dedicated per-request connection
+inside a single ``db.read_snapshot`` transaction, so a concurrent confirm
+committing between the voucher check and the address read cannot leak the
+new table into the old voucher's report -- the snapshot check either sees
+the change and fails with 409, or the change stays invisible to the whole
+rehearsal.  The two versions are never mixed.
 """
 from __future__ import annotations
 
@@ -237,6 +245,12 @@ def compute_impact(conn: sqlite3.Connection, settings: Settings,
     voucher cannot be honoured.  Purely in-memory: no address row and no
     match log is ever written, and the voucher stays valid for a later
     confirm.
+
+    ``conn`` must already sit inside a consistent read snapshot
+    (``db.read_snapshot``) on a connection no other request shares: the
+    voucher check, the address rows, the recent queries and every consensus
+    lookup below are separate SELECTs, and only one pinned snapshot keeps
+    them all on the same database version.
     """
     voucher = _load_voucher(conn, token)
     valid_rows = json.loads(voucher["valid_rows_json"])

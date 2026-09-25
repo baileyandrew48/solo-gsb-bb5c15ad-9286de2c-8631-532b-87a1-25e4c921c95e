@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from fastapi import Body, Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -51,6 +51,23 @@ def get_conn() -> db.sqlite3.Connection:
         _conn = db.connect()
         db.init_db(_conn)
     return _conn
+
+
+def isolated_conn() -> Iterator[db.sqlite3.Connection]:
+    """Per-request connection for endpoints that pin their own transaction
+    boundary.
+
+    ``get_conn`` shares one connection -- and thus one transaction state --
+    across all in-flight requests.  An endpoint that needs a consistent read
+    snapshot must not let another request's writes (or transactions) slip
+    into that snapshot, so it gets a private connection that is closed when
+    the request finishes.
+    """
+    conn = db.connect()
+    try:
+        yield conn
+    finally:
+        conn.close()
 
 
 def settings_dep() -> Settings:
@@ -209,7 +226,7 @@ async def preview_csv(file: UploadFile = File(...),
 
 @app.get("/api/addresses/preview/{token}/impact")
 def preview_impact(token: str,
-                   conn: db.sqlite3.Connection = Depends(get_conn),
+                   conn: db.sqlite3.Connection = Depends(isolated_conn),
                    settings: Settings = Depends(settings_dep)) -> dict[str, Any]:
     """导入影响预演：对预览凭证中的有效待导入行做内存干跑。
 
@@ -218,9 +235,16 @@ def preview_impact(token: str,
     及复核共识逻辑重跑按日志时间倒序取出的最近 100 个不同原始查询；逐条
     对比前后状态与自动命中目标，分类为 改善 / 退化 / 目标改派 / 不变 并汇总。
     无效及重复行不参与；预演不写入地址和匹配日志，凭证保持有效。
+
+    整个预演在**同一 SQLite 一致性读快照**（独立专用连接 + ``db.read_snapshot``
+    读事务）中完成凭证校验、地址读取、最近查询及共识读取：预演期间其他请求
+    确认导入不会混入本次报告——表在校验前已变则快照校验返回 409，在校验后
+    变化对本快照不可见，报告始终完整基于单一版本，绝不混用两个版本；读事务
+    在异常时同样被释放。
     """
     try:
-        return import_impact.compute_impact(conn, settings, token)
+        with db.read_snapshot(conn):
+            return import_impact.compute_impact(conn, settings, token)
     except ingest.PreviewExpired as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ingest.PreviewTableChanged as exc:

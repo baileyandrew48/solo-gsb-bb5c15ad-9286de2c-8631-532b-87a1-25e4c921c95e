@@ -1,9 +1,12 @@
 """Tests for the import impact dry-run (``GET /api/addresses/preview/{token}/impact``)."""
 from __future__ import annotations
 
+import json
+
 import pytest
 from fastapi.testclient import TestClient
 
+from app import db, ingest  # noqa: E402
 from app.main import app, get_conn  # noqa: E402
 
 
@@ -217,6 +220,84 @@ def test_impact_table_changed(client):
 
     r = _impact(client, token)
     assert r.status_code == 409
+
+
+def test_impact_consistent_snapshot_under_concurrent_confirm(client, monkeypatch):
+    """A confirm committing between the voucher check and the address read
+    must not leak the new table into the old voucher's report."""
+    # A query the current table cannot cover -> no_match log.
+    query = "42 Impfx Race Lane, Raceville"
+    r = client.post("/api/match", json={"query": query})
+    assert r.json()["status"] == "no_match"
+
+    # Voucher A would import exactly that address; voucher B (the concurrent
+    # import) carries the same text under a different external id.
+    csv_a = b'external_id,address\nIMP-RACE-A,"42 Impfx Race Lane, Raceville"\n'
+    token_a = _preview(client, csv_a)["preview_token"]
+    csv_b = b'external_id,address\nIMP-RACE-B,"42 Impfx Race Lane, Raceville"\n'
+    token_b = _preview(client, csv_b)["preview_token"]
+
+    real_all_addresses = db.all_addresses
+    fired = []
+
+    def confirm_between_check_and_read(conn):
+        # The dry-run's address-table read: a concurrent confirm commits on
+        # its own connection right now, after the voucher check but before
+        # this read.  Without one pinned snapshot this read would already
+        # see voucher B's row and mix it into voucher A's report.
+        if not fired:
+            fired.append(True)
+            other = db.connect()
+            try:
+                result = ingest.confirm_csv(other, csv_b, token_b)
+                assert result["inserted"] == 1
+            finally:
+                other.close()
+        return real_all_addresses(conn)
+
+    monkeypatch.setattr(db, "all_addresses", confirm_between_check_and_read)
+
+    r = _impact(client, token_a)
+    assert r.status_code == 200
+    assert fired, "the dry-run must read the address table through db.all_addresses"
+    item = _item_for(r.json(), query)
+    # The whole report comes from the pre-confirm snapshot: the concurrently
+    # imported address never leaks into voucher A's dry-run (no mixed versions).
+    assert item["before"]["status"] == "no_match"
+    assert item["before"]["target"] is None
+    assert item["after"]["status"] == "auto_matched"
+    assert item["after"]["target"] == {
+        "kind": "new",
+        "csv_line": 2,
+        "full_text": "42 Impfx Race Lane, Raceville",
+    }
+    assert item["category"] == "improved"
+
+    # The concurrent confirm really committed: fresh reads see voucher B's row.
+    assert any(
+        a["external_id"] == "IMP-RACE-B"
+        for a in client.get("/api/addresses?limit=500").json()["items"]
+    )
+
+
+def test_read_snapshot_released_on_error():
+    conn = db.connect()
+    try:
+        db.init_db(conn)
+        with pytest.raises(RuntimeError, match="boom"):
+            with db.read_snapshot(conn):
+                conn.execute("SELECT 1").fetchone()
+                assert conn.in_transaction
+                raise RuntimeError("boom")
+        # The read transaction is released even though the block raised, and
+        # the connection stays usable afterwards.
+        assert not conn.in_transaction
+        with db.read_snapshot(conn):
+            snap = db.address_table_snapshot(conn)
+        assert not conn.in_transaction
+        assert json.loads(snap)["count"] == db.count_addresses(conn)
+    finally:
+        conn.close()
 
 
 def test_impact_expired_token(client):
